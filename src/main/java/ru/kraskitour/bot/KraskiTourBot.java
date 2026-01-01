@@ -18,11 +18,13 @@ import ru.kraskitour.bot.model.UserSession;
 import ru.kraskitour.bot.model.UserState;
 import ru.kraskitour.bot.util.*;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class KraskiTourBot extends TelegramLongPollingBot {
     private static final Logger log = LoggerFactory.getLogger(KraskiTourBot.class);
@@ -42,6 +44,12 @@ public class KraskiTourBot extends TelegramLongPollingBot {
     private final SessionRepository sessions;
     private final AdminRepository admins;
     private final RequestRepository requests;
+
+    /**
+     * Кэш file_id для картинок из ресурсов (images/1.jpg ...).
+     * После первой отправки Telegram вернет file_id, и дальше фото будет уходить без повторной загрузки.
+     */
+    private final Map<String, String> resourcePhotoFileIdCache = new ConcurrentHashMap<>();
 
     public KraskiTourBot(BotConfig cfg, SessionRepository sessions, AdminRepository admins, RequestRepository requests) {
         this.cfg = cfg;
@@ -538,23 +546,50 @@ public class KraskiTourBot extends TelegramLongPollingBot {
     }
 
     private void sendPhotoFromResources(long chatId, String resourcePath, String caption, InlineKeyboardMarkup kb) throws TelegramApiException {
-        InputStream is = getClass().getClassLoader().getResourceAsStream(resourcePath);
-        if (is == null) {
-            // если картинки нет — отправим просто текст
-            sendHtml(chatId, caption + "\n\n(⚠️ Не найден ресурс: " + resourcePath + ")", kb);
+        // 1) если уже знаем file_id — шлем без загрузки
+        String cachedFileId = resourcePhotoFileIdCache.get(resourcePath);
+        if (cachedFileId != null && !cachedFileId.isBlank()) {
+            SendPhoto sp = new SendPhoto();
+            sp.setChatId(String.valueOf(chatId));
+            sp.setPhoto(new InputFile(cachedFileId));
+            sp.setCaption(caption);
+            sp.setParseMode(ParseMode.HTML);
+            if (kb != null) sp.setReplyMarkup(kb);
+            execute(sp);
             return;
         }
 
-        String fileName = resourcePath.contains("/") ? resourcePath.substring(resourcePath.lastIndexOf('/') + 1) : "image.jpg";
+        // 2) иначе грузим из ресурсов и после отправки сохраняем file_id
+        try (InputStream is = getClass().getClassLoader().getResourceAsStream(resourcePath)) {
+            if (is == null) {
+                sendHtml(chatId, caption + "\n\n(⚠️ Не найден ресурс: " + resourcePath + ")", kb);
+                return;
+            }
 
-        SendPhoto sp = new SendPhoto();
-        sp.setChatId(String.valueOf(chatId));
-        sp.setPhoto(new InputFile(is, fileName));
-        sp.setCaption(caption);
-        sp.setParseMode(ParseMode.HTML);
-        if (kb != null) sp.setReplyMarkup(kb);
+            String fileName = resourcePath.contains("/")
+                    ? resourcePath.substring(resourcePath.lastIndexOf('/') + 1)
+                    : "image.jpg";
 
-        execute(sp);
+            SendPhoto sp = new SendPhoto();
+            sp.setChatId(String.valueOf(chatId));
+            sp.setPhoto(new InputFile(is, fileName));
+            sp.setCaption(caption);
+            sp.setParseMode(ParseMode.HTML);
+            if (kb != null) sp.setReplyMarkup(kb);
+
+            Message sent = execute(sp);
+
+            // достаем file_id (берем самый большой размер)
+            List<PhotoSize> photos = sent.getPhoto();
+            if (photos != null && !photos.isEmpty()) {
+                PhotoSize best = photos.get(photos.size() - 1);
+                if (best.getFileId() != null && !best.getFileId().isBlank()) {
+                    resourcePhotoFileIdCache.put(resourcePath, best.getFileId());
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private void answerCb(String callbackId) throws TelegramApiException {
