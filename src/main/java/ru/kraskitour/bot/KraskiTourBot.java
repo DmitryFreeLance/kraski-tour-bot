@@ -319,9 +319,10 @@ public class KraskiTourBot extends TelegramLongPollingBot {
             finalizeGeneric(from, userId, session, source);
         }
 
-        // сброс и в меню
+        // ✅ ВАЖНО: больше не перекидываем сразу на /start.
+        // Сбросим сценарий и покажем подтверждение + кнопку "вернуться в меню"
         sessions.clear(userId, chatId);
-        sendStart(chatId);
+        sendHtml(chatId, Texts.PHONE_SAVED, Keyboards.backToMenuOnlyLowercase());
     }
 
     private void finalizeTour(User from, long userId, UserSession session) {

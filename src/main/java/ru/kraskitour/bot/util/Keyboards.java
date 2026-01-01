@@ -10,12 +10,12 @@ public class Keyboards {
 
     public static InlineKeyboardMarkup startMenu(String managerUrl) {
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
-        rows.add(one(cb("🏝️ ПОДОБРАТЬ ТУР", Callback.MENU_TOUR)));
+        rows.add(one(cb("🏝️ ЗАЯВКА НА ПОДБОР ТУРА", Callback.MENU_TOUR)));
         rows.add(one(cb("🛂 ШЕНГЕНСКАЯ ВИЗА", Callback.MENU_SCHENGEN)));
         rows.add(one(cb("🏨 ОТЕЛЬ БЕЗ ТУРА", Callback.MENU_HOTEL)));
         rows.add(one(cb("📲 НАШИ СОЦСЕТИ", Callback.MENU_SOCIALS)));
         rows.add(one(cb("📍 НАШ ОФИС", Callback.MENU_OFFICE)));
-        rows.add(one(url("💬 НАПИСАТЬ МЕНЕДЖЕРУ", managerUrl)));
+        rows.add(one(url("💬 НАПИСАТЬ НАМ", managerUrl)));
         return markup(rows);
     }
 
@@ -45,6 +45,13 @@ public class Keyboards {
     public static InlineKeyboardMarkup cancelToMenuOnly() {
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
         rows.add(one(cb("🏠 Вернуться в меню", Callback.BACK_TO_MENU)));
+        return markup(rows);
+    }
+
+    // ✅ Новая клавиатура: только кнопка "вернуться в меню" (как просили)
+    public static InlineKeyboardMarkup backToMenuOnlyLowercase() {
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+        rows.add(one(cb("вернуться в меню", Callback.BACK_TO_MENU)));
         return markup(rows);
     }
 
