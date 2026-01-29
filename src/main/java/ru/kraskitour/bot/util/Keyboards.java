@@ -11,6 +11,7 @@ public class Keyboards {
     public static InlineKeyboardMarkup startMenu(String managerUrl) {
         List<List<InlineKeyboardButton>> rows = new ArrayList<>();
         rows.add(one(cb("🏝️ ЗАЯВКА НА ПОДБОР ТУРА", Callback.MENU_TOUR)));
+        rows.add(one(url("\uD83C\uDF10 НАШ САЙТ•ПОИСК ТУРА", "http://краскитур.рф")));
         rows.add(one(cb("🛂 ШЕНГЕНСКАЯ ВИЗА", Callback.MENU_SCHENGEN)));
         rows.add(one(cb("🏨 ОТЕЛЬ БЕЗ ТУРА", Callback.MENU_HOTEL)));
         rows.add(one(cb("📲 НАШИ СОЦСЕТИ", Callback.MENU_SOCIALS)));
