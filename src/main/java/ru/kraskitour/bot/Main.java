@@ -6,6 +6,7 @@ import ru.kraskitour.bot.db.AdminRepository;
 import ru.kraskitour.bot.db.Db;
 import ru.kraskitour.bot.db.RequestRepository;
 import ru.kraskitour.bot.db.SessionRepository;
+import ru.kraskitour.bot.db.SettingsRepository;
 import ru.kraskitour.bot.max.MaxApiClient;
 import ru.kraskitour.bot.max.MaxLongPoller;
 
@@ -26,9 +27,15 @@ public class Main {
         SessionRepository sessionRepo = new SessionRepository(db);
         RequestRepository requestRepo = new RequestRepository(db);
         ActiveUserRepository activeUserRepo = new ActiveUserRepository(db);
+        SettingsRepository settingsRepo = new SettingsRepository(db);
+
+        String managerUrl = settingsRepo.get("manager_url");
+        if (managerUrl == null || managerUrl.isBlank()) {
+            managerUrl = cfg.managerUrl;
+        }
 
         MaxApiClient api = new MaxApiClient(cfg.token, cfg.apiBaseUrl);
-        KraskiTourBot bot = new KraskiTourBot(cfg, api, sessionRepo, adminRepo, requestRepo, activeUserRepo);
+        KraskiTourBot bot = new KraskiTourBot(cfg, api, sessionRepo, adminRepo, requestRepo, activeUserRepo, settingsRepo, managerUrl);
 
         System.out.println("Started MAX bot @" + cfg.username);
 

@@ -11,6 +11,7 @@ import ru.kraskitour.bot.db.ActiveUserRepository;
 import ru.kraskitour.bot.db.AdminRepository;
 import ru.kraskitour.bot.db.RequestRepository;
 import ru.kraskitour.bot.db.SessionRepository;
+import ru.kraskitour.bot.db.SettingsRepository;
 import ru.kraskitour.bot.max.MaxApiClient;
 import ru.kraskitour.bot.model.UserSession;
 import ru.kraskitour.bot.model.UserState;
@@ -51,7 +52,9 @@ public class KraskiTourBot {
     private final AdminRepository admins;
     private final RequestRepository requests;
     private final ActiveUserRepository activeUsers;
+    private final SettingsRepository settings;
     private final ObjectMapper mapper = new ObjectMapper();
+    private volatile String managerUrl;
 
     /**
      * Кэш payload для картинок из ресурсов (images/1.jpg ...).
@@ -59,13 +62,16 @@ public class KraskiTourBot {
      */
     private final Map<String, ObjectNode> resourcePhotoCache = new ConcurrentHashMap<>();
 
-    public KraskiTourBot(BotConfig cfg, MaxApiClient api, SessionRepository sessions, AdminRepository admins, RequestRepository requests, ActiveUserRepository activeUsers) {
+    public KraskiTourBot(BotConfig cfg, MaxApiClient api, SessionRepository sessions, AdminRepository admins, RequestRepository requests,
+                         ActiveUserRepository activeUsers, SettingsRepository settings, String managerUrl) {
         this.cfg = cfg;
         this.api = api;
         this.sessions = sessions;
         this.admins = admins;
         this.requests = requests;
         this.activeUsers = activeUsers;
+        this.settings = settings;
+        this.managerUrl = managerUrl;
     }
 
     public void handleUpdate(JsonNode update) {
@@ -219,6 +225,11 @@ public class KraskiTourBot {
                 return;
             }
 
+            if (text.startsWith("/link")) {
+                handleLinkCommand(ctx, text);
+                return;
+            }
+
             // если ждём ввод ID в админке
             if (session.state == UserState.ADMIN_ADD_WAIT_ID) {
                 handleAdminAddId(ctx, text);
@@ -290,7 +301,7 @@ public class KraskiTourBot {
     // ====== Меню / Старт ======
 
     private void sendStart(Ctx ctx) {
-        sendPhotoFromResources(ctx, "images/1.jpg", Texts.START_CAPTION, Keyboards.startMenu(cfg.managerUrl));
+        sendPhotoFromResources(ctx, "images/1.jpg", Texts.START_CAPTION, Keyboards.startMenu(managerUrl));
     }
 
     private void startTour(Ctx ctx) {
@@ -301,7 +312,7 @@ public class KraskiTourBot {
 
     private void showSchengen(Ctx ctx) {
         sessions.clear(ctx.userId, ctx.chatId);
-        sendHtml(ctx, Texts.SCHENGEN_MAIN, Keyboards.schengenMenu(cfg.managerUrl));
+        sendHtml(ctx, Texts.SCHENGEN_MAIN, Keyboards.schengenMenu(managerUrl));
     }
 
     private void showSchengenPrices(Ctx ctx) {
@@ -625,6 +636,31 @@ public class KraskiTourBot {
         }
         sb.append("\nЧтобы назначить админа: <code>/add USER_ID</code>");
         sendHtml(ctx, sb.toString(), null);
+    }
+
+    private void handleLinkCommand(Ctx ctx, String text) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sendHtml(ctx, "⛔ Нет доступа.", null);
+            return;
+        }
+
+        String[] parts = text.trim().split("\\s+");
+        if (parts.length >= 2) {
+            try {
+                long id = Long.parseLong(parts[1]);
+                String url = "max://user/" + id;
+                managerUrl = url;
+                settings.set("manager_url", url);
+                sendHtml(ctx, "✅ Ссылка обновлена: <code>" + url + "</code>", Keyboards.adminMenu());
+            } catch (NumberFormatException e) {
+                sendHtml(ctx, "Введите корректный <b>user_id</b>. Пример: <code>/link 123456</code>", null);
+            }
+            return;
+        }
+
+        String url = (managerUrl == null || managerUrl.isBlank()) ? "(не задана)" : managerUrl;
+        sendHtml(ctx, "Текущая ссылка менеджера: <code>" + url + "</code>\n" +
+                "Чтобы обновить: <code>/link USER_ID</code>", null);
     }
 
     // ====== Helpers ======

@@ -56,6 +56,13 @@ public class Db {
                   last_seen  INTEGER NOT NULL
                 );
             """);
+
+            st.execute("""
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                  key   TEXT PRIMARY KEY,
+                  value TEXT NOT NULL
+                );
+            """);
         }
     }
 }
