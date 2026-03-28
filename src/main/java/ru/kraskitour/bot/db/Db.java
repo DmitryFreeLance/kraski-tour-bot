@@ -46,6 +46,16 @@ public class Db {
                   payload    TEXT    NOT NULL
                 );
             """);
+
+            st.execute("""
+                CREATE TABLE IF NOT EXISTS active_users (
+                  user_id    INTEGER PRIMARY KEY,
+                  first_name TEXT,
+                  last_name  TEXT,
+                  username   TEXT,
+                  last_seen  INTEGER NOT NULL
+                );
+            """);
         }
     }
 }

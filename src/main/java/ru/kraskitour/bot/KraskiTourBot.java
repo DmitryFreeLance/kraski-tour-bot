@@ -1,33 +1,38 @@
 package ru.kraskitour.bot;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.telegram.telegrambots.bots.TelegramLongPollingBot;
-import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
-import org.telegram.telegrambots.meta.api.methods.ParseMode;
-import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
-import org.telegram.telegrambots.meta.api.objects.*;
-import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
-import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import ru.kraskitour.bot.config.BotConfig;
+import ru.kraskitour.bot.db.ActiveUserRepository;
 import ru.kraskitour.bot.db.AdminRepository;
 import ru.kraskitour.bot.db.RequestRepository;
 import ru.kraskitour.bot.db.SessionRepository;
+import ru.kraskitour.bot.max.MaxApiClient;
 import ru.kraskitour.bot.model.UserSession;
 import ru.kraskitour.bot.model.UserState;
-import ru.kraskitour.bot.util.*;
+import ru.kraskitour.bot.util.Callback;
+import ru.kraskitour.bot.util.Keyboards;
+import ru.kraskitour.bot.util.PhoneUtil;
+import ru.kraskitour.bot.util.Texts;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-public class KraskiTourBot extends TelegramLongPollingBot {
+public class KraskiTourBot {
     private static final Logger log = LoggerFactory.getLogger(KraskiTourBot.class);
+
+    private record Ctx(long userId, long chatId, Long sendChatId) {}
 
     // keys in session.data
     private static final String K_TOUR_Q1 = "tour_q1";
@@ -36,94 +41,130 @@ public class KraskiTourBot extends TelegramLongPollingBot {
     private static final String K_TOUR_Q4 = "tour_q4";
     private static final String K_PHONE = "phone";
 
-    private static final String K_HOTEL_PHOTO_FILE_ID = "hotel_photo_file_id";
+    private static final String K_HOTEL_PHOTO_ATTACHMENT_JSON = "hotel_photo_attachment_json";
     private static final String K_HOTEL_PICK_Q1 = "hotel_pick_q1";
     private static final String K_HOTEL_PICK_Q2 = "hotel_pick_q2";
 
     private final BotConfig cfg;
+    private final MaxApiClient api;
     private final SessionRepository sessions;
     private final AdminRepository admins;
     private final RequestRepository requests;
+    private final ActiveUserRepository activeUsers;
+    private final ObjectMapper mapper = new ObjectMapper();
 
     /**
-     * Кэш file_id для картинок из ресурсов (images/1.jpg ...).
-     * После первой отправки Telegram вернет file_id, и дальше фото будет уходить без повторной загрузки.
+     * Кэш payload для картинок из ресурсов (images/1.jpg ...).
+     * После первой загрузки в MAX можно переиспользовать payload.
      */
-    private final Map<String, String> resourcePhotoFileIdCache = new ConcurrentHashMap<>();
+    private final Map<String, ObjectNode> resourcePhotoCache = new ConcurrentHashMap<>();
 
-    public KraskiTourBot(BotConfig cfg, SessionRepository sessions, AdminRepository admins, RequestRepository requests) {
+    public KraskiTourBot(BotConfig cfg, MaxApiClient api, SessionRepository sessions, AdminRepository admins, RequestRepository requests, ActiveUserRepository activeUsers) {
         this.cfg = cfg;
+        this.api = api;
         this.sessions = sessions;
         this.admins = admins;
         this.requests = requests;
+        this.activeUsers = activeUsers;
     }
 
-    @Override
-    public String getBotUsername() {
-        return cfg.username;
-    }
-
-    @Override
-    public String getBotToken() {
-        return cfg.token;
-    }
-
-    @Override
-    public void onUpdateReceived(Update update) {
+    public void handleUpdate(JsonNode update) {
+        if (update == null || update.isNull()) return;
+        String type = update.path("update_type").asText("");
         try {
-            if (update.hasCallbackQuery()) {
-                handleCallback(update.getCallbackQuery());
-                return;
-            }
-            if (update.hasMessage()) {
-                handleMessage(update.getMessage());
+            switch (type) {
+                case "bot_started" -> handleBotStarted(update);
+                case "message_created" -> handleMessage(update.path("message"));
+                case "message_callback" -> handleCallback(update);
+                default -> {
+                    // ignore other updates
+                }
             }
         } catch (Exception e) {
             log.error("Update handling error", e);
         }
     }
 
-    private void handleCallback(CallbackQuery q) throws TelegramApiException {
-        answerCb(q.getId());
+    private void handleBotStarted(JsonNode update) {
+        long userId = pickLong(
+                update.path("user").path("user_id"),
+                update.path("message").path("sender").path("user_id")
+        );
+        if (userId <= 0) return;
 
-        long chatId = q.getMessage().getChatId();
-        long userId = q.getFrom().getId();
-        String data = q.getData();
+        updateActiveUser(update.path("user"));
+
+        Long sendChatId = pickLongNullable(
+                update.path("chat_id"),
+                update.path("message").path("recipient").path("chat_id")
+        );
+        long chatId = (sendChatId != null) ? sendChatId : userId;
+
+        Ctx ctx = new Ctx(userId, chatId, sendChatId);
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendStart(ctx);
+    }
+
+    private void handleCallback(JsonNode update) {
+        JsonNode cb = update.path("callback");
+        String payload = cb.path("payload").asText("");
+        String callbackId = cb.path("callback_id").asText(null);
+
+        long userId = pickLong(
+                cb.path("user").path("user_id"),
+                cb.path("message").path("sender").path("user_id"),
+                update.path("message").path("sender").path("user_id"),
+                update.path("user").path("user_id")
+        );
+        if (userId <= 0) return;
+
+        updateActiveUser(cb.path("user"));
+
+        Long sendChatId = pickLongNullable(
+                cb.path("message").path("recipient").path("chat_id"),
+                update.path("message").path("recipient").path("chat_id")
+        );
+        long chatId = (sendChatId != null) ? sendChatId : userId;
+        Ctx ctx = new Ctx(userId, chatId, sendChatId);
+
+        if (callbackId != null && !callbackId.isBlank()) {
+            api.answerCallback(callbackId, mapper.createObjectNode());
+        }
 
         // Любой callback может отменить текущий сценарий
-        if (Callback.BACK_TO_MENU.equals(data)) {
-            sessions.clear(userId, chatId);
-            sendStart(chatId);
+        if (Callback.BACK_TO_MENU.equals(payload)) {
+            sessions.clear(ctx.userId, ctx.chatId);
+            sendStart(ctx);
             return;
         }
 
-        switch (data) {
+        switch (payload) {
             // главное меню
-            case Callback.MENU_TOUR -> startTour(chatId, userId);
-            case Callback.MENU_SCHENGEN -> showSchengen(chatId, userId);
-            case Callback.MENU_HOTEL -> showHotelMenu(chatId, userId);
-            case Callback.MENU_SOCIALS -> showSocials(chatId, userId);
-            case Callback.MENU_OFFICE -> showOffice(chatId, userId);
+            case Callback.MENU_TOUR -> startTour(ctx);
+            case Callback.MENU_SCHENGEN -> showSchengen(ctx);
+            case Callback.MENU_HOTEL -> showHotelMenu(ctx);
+            case Callback.MENU_SOCIALS -> showSocials(ctx);
+            case Callback.MENU_OFFICE -> showOffice(ctx);
 
             // шенген
-            case Callback.SCHENGEN_PRICES -> showSchengenPrices(chatId, userId);
-            case Callback.SCHENGEN_BACK -> showSchengen(chatId, userId);
+            case Callback.SCHENGEN_PRICES -> showSchengenPrices(ctx);
+            case Callback.SCHENGEN_BACK -> showSchengen(ctx);
 
             // отели
-            case Callback.HOTEL_COMPARE -> startHotelCompare(chatId, userId);
-            case Callback.HOTEL_PICK -> startHotelPick(chatId, userId);
+            case Callback.HOTEL_COMPARE -> startHotelCompare(ctx);
+            case Callback.HOTEL_PICK -> startHotelPick(ctx);
 
             // соцсети
-            case Callback.SOC_TG -> showTgChannel(chatId, userId);
-            case Callback.SOC_IG -> showInstagram(chatId, userId);
-            case Callback.SOC_BACK -> showSocials(chatId, userId);
+            case Callback.SOC_TG -> showTgChannel(ctx);
+            case Callback.SOC_IG -> showInstagram(ctx);
+            case Callback.SOC_BACK -> showSocials(ctx);
 
             // админка
-            case Callback.ADMIN_MENU -> openAdmin(chatId, userId);
-            case Callback.ADMIN_LIST -> adminList(chatId, userId);
-            case Callback.ADMIN_ADD -> adminAddFlow(chatId, userId);
-            case Callback.ADMIN_REMOVE -> adminRemoveFlow(chatId, userId);
-            case Callback.ADMIN_REQUESTS -> adminLastRequests(chatId, userId);
+            case Callback.ADMIN_MENU -> openAdmin(ctx);
+            case Callback.ADMIN_LIST -> adminList(ctx);
+            case Callback.ADMIN_ADD -> adminAddFlow(ctx);
+            case Callback.ADMIN_REMOVE -> adminRemoveFlow(ctx);
+            case Callback.ADMIN_REQUESTS -> adminLastRequests(ctx);
 
             default -> {
                 // ignore unknown callbacks
@@ -131,33 +172,60 @@ public class KraskiTourBot extends TelegramLongPollingBot {
         }
     }
 
-    private void handleMessage(Message msg) throws TelegramApiException {
-        long chatId = msg.getChatId();
-        long userId = msg.getFrom().getId();
+    private void handleMessage(JsonNode msg) {
+        if (msg == null || msg.isNull()) return;
+        if (msg.path("sender").path("is_bot").asBoolean(false)) return;
 
-        UserSession session = sessions.getOrCreate(userId, chatId);
+        long userId = pickLong(msg.path("sender").path("user_id"));
+        if (userId <= 0) return;
 
-        if (msg.hasText()) {
-            String text = msg.getText().trim();
+        updateActiveUser(msg.path("sender"));
 
+        Long sendChatId = pickLongNullable(msg.path("recipient").path("chat_id"));
+        long chatId = (sendChatId != null) ? sendChatId : userId;
+        Ctx ctx = new Ctx(userId, chatId, sendChatId);
+
+        UserSession session = sessions.getOrCreate(ctx.userId, ctx.chatId);
+        JsonNode body = msg.path("body");
+
+        // если ждём фото, можно обработать сразу
+        if (session.state == UserState.HOTEL_COMPARE_WAIT_PHOTO) {
+            ObjectNode imageAtt = extractFirstAttachment(body, "image");
+            if (imageAtt != null) {
+                session.data.put(K_HOTEL_PHOTO_ATTACHMENT_JSON, imageAtt.toString());
+                sessions.setState(ctx.userId, ctx.chatId, UserState.HOTEL_COMPARE_WAIT_PHONE, session.data);
+                sendHtml(ctx,
+                        "Спасибо , Ваша заявка уже в работе.\nНапишите свой номер телефона , мы скоро свяжемся с Вами 📞",
+                        Keyboards.cancelToMenuOnly());
+                return;
+            }
+        }
+
+        String text = body.path("text").isTextual() ? body.path("text").asText().trim() : null;
+        if (text != null && !text.isBlank()) {
             if ("/start".equalsIgnoreCase(text)) {
-                sessions.clear(userId, chatId);
-                sendStart(chatId);
+                sessions.clear(ctx.userId, ctx.chatId);
+                sendStart(ctx);
                 return;
             }
 
             if ("/admin".equalsIgnoreCase(text)) {
-                openAdmin(chatId, userId);
+                openAdmin(ctx);
+                return;
+            }
+
+            if (text.startsWith("/add")) {
+                handleAddCommand(ctx, text);
                 return;
             }
 
             // если ждём ввод ID в админке
             if (session.state == UserState.ADMIN_ADD_WAIT_ID) {
-                handleAdminAddId(chatId, userId, session, text);
+                handleAdminAddId(ctx, text);
                 return;
             }
             if (session.state == UserState.ADMIN_REMOVE_WAIT_ID) {
-                handleAdminRemoveId(chatId, userId, session, text);
+                handleAdminRemoveId(ctx, text);
                 return;
             }
 
@@ -165,143 +233,125 @@ public class KraskiTourBot extends TelegramLongPollingBot {
             switch (session.state) {
                 case TOUR_Q1_COUNTRIES_FROM -> {
                     session.data.put(K_TOUR_Q1, text);
-                    sessions.setState(userId, chatId, UserState.TOUR_Q2_COMPOSITION, session.data);
-                    sendPhotoFromResources(chatId, "images/3.jpg", Texts.TOUR_Q2, null);
+                    sessions.setState(ctx.userId, ctx.chatId, UserState.TOUR_Q2_COMPOSITION, session.data);
+                    sendPhotoFromResources(ctx, "images/3.jpg", Texts.TOUR_Q2, null);
                 }
                 case TOUR_Q2_COMPOSITION -> {
                     session.data.put(K_TOUR_Q2, text);
-                    sessions.setState(userId, chatId, UserState.TOUR_Q3_DATES_NIGHTS, session.data);
-                    sendPhotoFromResources(chatId, "images/4.jpg", Texts.TOUR_Q3, null);
+                    sessions.setState(ctx.userId, ctx.chatId, UserState.TOUR_Q3_DATES_NIGHTS, session.data);
+                    sendPhotoFromResources(ctx, "images/4.jpg", Texts.TOUR_Q3, null);
                 }
                 case TOUR_Q3_DATES_NIGHTS -> {
                     session.data.put(K_TOUR_Q3, text);
-                    sessions.setState(userId, chatId, UserState.TOUR_Q4_BUDGET_HOTEL, session.data);
-                    sendPhotoFromResources(chatId, "images/5.jpg", Texts.TOUR_Q4, null);
+                    sessions.setState(ctx.userId, ctx.chatId, UserState.TOUR_Q4_BUDGET_HOTEL, session.data);
+                    sendPhotoFromResources(ctx, "images/5.jpg", Texts.TOUR_Q4, null);
                 }
                 case TOUR_Q4_BUDGET_HOTEL -> {
                     session.data.put(K_TOUR_Q4, text);
-                    sessions.setState(userId, chatId, UserState.TOUR_PHONE, session.data);
-                    sendHtml(chatId, Texts.ASK_PHONE, null);
+                    sessions.setState(ctx.userId, ctx.chatId, UserState.TOUR_PHONE, session.data);
+                    sendHtml(ctx, Texts.ASK_PHONE, null);
                 }
-                case TOUR_PHONE -> {
-                    handlePhoneInput(msg.getFrom(), chatId, userId, session, text, "Подобрать тур");
-                }
+                case TOUR_PHONE -> handlePhoneInput(ctx, msg.path("sender"), session, text, "Подобрать тур");
 
                 case HOTEL_PICK_Q1_COUNTRY_CITY -> {
                     session.data.put(K_HOTEL_PICK_Q1, text);
-                    sessions.setState(userId, chatId, UserState.HOTEL_PICK_Q2_DATES_PEOPLE, session.data);
-                    sendHtml(chatId, Texts.HOTEL_PICK_Q2, null);
+                    sessions.setState(ctx.userId, ctx.chatId, UserState.HOTEL_PICK_Q2_DATES_PEOPLE, session.data);
+                    sendHtml(ctx, Texts.HOTEL_PICK_Q2, null);
                 }
                 case HOTEL_PICK_Q2_DATES_PEOPLE -> {
                     session.data.put(K_HOTEL_PICK_Q2, text);
-                    sessions.setState(userId, chatId, UserState.HOTEL_PICK_WAIT_PHONE, session.data);
-                    sendHtml(chatId, Texts.ASK_PHONE, null);
+                    sessions.setState(ctx.userId, ctx.chatId, UserState.HOTEL_PICK_WAIT_PHONE, session.data);
+                    sendHtml(ctx, Texts.ASK_PHONE, null);
                 }
-                case HOTEL_PICK_WAIT_PHONE -> {
-                    handlePhoneInput(msg.getFrom(), chatId, userId, session, text, "Подобрать отель");
-                }
+                case HOTEL_PICK_WAIT_PHONE -> handlePhoneInput(ctx, msg.path("sender"), session, text, "Подобрать отель");
 
-                case HOTEL_COMPARE_WAIT_PHONE -> {
-                    handlePhoneInput(msg.getFrom(), chatId, userId, session, text, "Сравнить цену");
-                }
+                case HOTEL_COMPARE_WAIT_PHONE -> handlePhoneInput(ctx, msg.path("sender"), session, text, "Сравнить цену");
 
-                default -> {
-                    // если пользователь пишет что-то вне сценария — вернем в меню
-                    sendStart(chatId);
-                }
+                default -> sendStart(ctx);
             }
             return;
         }
 
-        if (msg.hasContact()) {
-            Contact c = msg.getContact();
-            String phone = c.getPhoneNumber();
-            handlePhoneInput(msg.getFrom(), chatId, userId, session, phone, "Контакт");
-            return;
-        }
-
-        if (msg.hasPhoto()) {
-            if (session.state == UserState.HOTEL_COMPARE_WAIT_PHOTO) {
-                List<PhotoSize> photos = msg.getPhoto();
-                PhotoSize best = photos.get(photos.size() - 1); // обычно последняя — самая большая
-                session.data.put(K_HOTEL_PHOTO_FILE_ID, best.getFileId());
-                sessions.setState(userId, chatId, UserState.HOTEL_COMPARE_WAIT_PHONE, session.data);
-
-                sendHtml(chatId,
-                        "Спасибо , Ваша заявка уже в работе.\nНапишите свой номер телефона , мы скоро свяжемся с Вами 📞",
-                        Keyboards.cancelToMenuOnly());
-            } else {
-                // фото не ждали
-                sendStart(chatId);
+        // Попытка достать телефон из вложения контакта (если вдруг пришло)
+        if (session.state == UserState.TOUR_PHONE
+                || session.state == UserState.HOTEL_PICK_WAIT_PHONE
+                || session.state == UserState.HOTEL_COMPARE_WAIT_PHONE) {
+            String phone = extractContactPhone(body);
+            if (phone != null) {
+                handlePhoneInput(ctx, msg.path("sender"), session, phone, "Контакт");
+                return;
             }
         }
+
+        // если пользователь пишет что-то вне сценария — вернем в меню
+        sendStart(ctx);
     }
 
     // ====== Меню / Старт ======
 
-    private void sendStart(long chatId) throws TelegramApiException {
-        sendPhotoFromResources(chatId, "images/1.jpg", Texts.START_CAPTION, Keyboards.startMenu(cfg.managerUrl));
+    private void sendStart(Ctx ctx) {
+        sendPhotoFromResources(ctx, "images/1.jpg", Texts.START_CAPTION, Keyboards.startMenu(cfg.managerUrl));
     }
 
-    private void startTour(long chatId, long userId) throws TelegramApiException {
+    private void startTour(Ctx ctx) {
         Map<String, Object> data = new HashMap<>();
-        sessions.setState(userId, chatId, UserState.TOUR_Q1_COUNTRIES_FROM, data);
-        sendPhotoFromResources(chatId, "images/2.jpg", Texts.TOUR_Q1, null);
+        sessions.setState(ctx.userId, ctx.chatId, UserState.TOUR_Q1_COUNTRIES_FROM, data);
+        sendPhotoFromResources(ctx, "images/2.jpg", Texts.TOUR_Q1, null);
     }
 
-    private void showSchengen(long chatId, long userId) throws TelegramApiException {
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.SCHENGEN_MAIN, Keyboards.schengenMenu(cfg.managerUrl));
+    private void showSchengen(Ctx ctx) {
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.SCHENGEN_MAIN, Keyboards.schengenMenu(cfg.managerUrl));
     }
 
-    private void showSchengenPrices(long chatId, long userId) throws TelegramApiException {
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.SCHENGEN_PRICES, Keyboards.schengenPricesMenu());
+    private void showSchengenPrices(Ctx ctx) {
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.SCHENGEN_PRICES, Keyboards.schengenPricesMenu());
     }
 
-    private void showHotelMenu(long chatId, long userId) throws TelegramApiException {
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.HOTEL_MAIN, Keyboards.hotelMenu());
+    private void showHotelMenu(Ctx ctx) {
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.HOTEL_MAIN, Keyboards.hotelMenu());
     }
 
-    private void startHotelCompare(long chatId, long userId) throws TelegramApiException {
+    private void startHotelCompare(Ctx ctx) {
         Map<String, Object> data = new HashMap<>();
-        sessions.setState(userId, chatId, UserState.HOTEL_COMPARE_WAIT_PHOTO, data);
-        sendHtml(chatId, Texts.HOTEL_COMPARE_ASK_PHOTO, Keyboards.cancelToMenuOnly());
+        sessions.setState(ctx.userId, ctx.chatId, UserState.HOTEL_COMPARE_WAIT_PHOTO, data);
+        sendHtml(ctx, Texts.HOTEL_COMPARE_ASK_PHOTO, Keyboards.cancelToMenuOnly());
     }
 
-    private void startHotelPick(long chatId, long userId) throws TelegramApiException {
+    private void startHotelPick(Ctx ctx) {
         Map<String, Object> data = new HashMap<>();
-        sessions.setState(userId, chatId, UserState.HOTEL_PICK_Q1_COUNTRY_CITY, data);
-        sendHtml(chatId, Texts.HOTEL_PICK_Q1, null);
+        sessions.setState(ctx.userId, ctx.chatId, UserState.HOTEL_PICK_Q1_COUNTRY_CITY, data);
+        sendHtml(ctx, Texts.HOTEL_PICK_Q1, null);
     }
 
-    private void showSocials(long chatId, long userId) throws TelegramApiException {
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.SOCIALS_MAIN, Keyboards.socialsMenu());
+    private void showSocials(Ctx ctx) {
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.SOCIALS_MAIN, Keyboards.socialsMenu());
     }
 
-    private void showTgChannel(long chatId, long userId) throws TelegramApiException {
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.TG_CHANNEL, Keyboards.socialsSubMenu());
+    private void showTgChannel(Ctx ctx) {
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.TG_CHANNEL, Keyboards.socialsSubMenu());
     }
 
-    private void showInstagram(long chatId, long userId) throws TelegramApiException {
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.INSTAGRAM, Keyboards.socialsSubMenu());
+    private void showInstagram(Ctx ctx) {
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.INSTAGRAM, Keyboards.socialsSubMenu());
     }
 
-    private void showOffice(long chatId, long userId) throws TelegramApiException {
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.OFFICE, Keyboards.officeMenu());
+    private void showOffice(Ctx ctx) {
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.OFFICE, Keyboards.officeMenu());
     }
 
     // ====== Телефон / финализация заявок ======
 
-    private void handlePhoneInput(User from, long chatId, long userId, UserSession session, String rawPhone, String source) throws TelegramApiException {
+    private void handlePhoneInput(Ctx ctx, JsonNode from, UserSession session, String rawPhone, String source) {
         String phone = PhoneUtil.normalize(rawPhone);
         if (phone == null) {
-            sendHtml(chatId, "Пожалуйста, укажите корректный номер телефона 📞\nНапример: +79991234567", null);
+            sendHtml(ctx, "Пожалуйста, укажите корректный номер телефона 📞\nНапример: +79991234567", null);
             return;
         }
 
@@ -309,23 +359,23 @@ public class KraskiTourBot extends TelegramLongPollingBot {
 
         // Определяем какой сценарий завершаем по session.state (или по данным)
         if (session.state == UserState.TOUR_PHONE) {
-            finalizeTour(from, userId, session);
+            finalizeTour(from, ctx.userId, session);
         } else if (session.state == UserState.HOTEL_COMPARE_WAIT_PHONE) {
-            finalizeHotelCompare(from, userId, session);
+            finalizeHotelCompare(from, ctx.userId, session);
         } else if (session.state == UserState.HOTEL_PICK_WAIT_PHONE) {
-            finalizeHotelPick(from, userId, session);
+            finalizeHotelPick(from, ctx.userId, session);
         } else {
             // если вдруг пришли сюда не по сценарию
-            finalizeGeneric(from, userId, session, source);
+            finalizeGeneric(from, ctx.userId, session, source);
         }
 
         // ✅ ВАЖНО: больше не перекидываем сразу на /start.
         // Сбросим сценарий и покажем подтверждение + кнопку "вернуться в меню"
-        sessions.clear(userId, chatId);
-        sendHtml(chatId, Texts.PHONE_SAVED, Keyboards.backToMenuOnlyLowercase());
+        sessions.clear(ctx.userId, ctx.chatId);
+        sendHtml(ctx, Texts.PHONE_SAVED, Keyboards.backToMenuOnlyLowercase());
     }
 
-    private void finalizeTour(User from, long userId, UserSession session) {
+    private void finalizeTour(JsonNode from, long userId, UserSession session) {
         String name = userFullName(from);
         String tag = userTag(from);
         String phone = String.valueOf(session.data.getOrDefault(K_PHONE, ""));
@@ -349,11 +399,11 @@ public class KraskiTourBot extends TelegramLongPollingBot {
         requests.add("TOUR", userId, adminText);
     }
 
-    private void finalizeHotelCompare(User from, long userId, UserSession session) {
+    private void finalizeHotelCompare(JsonNode from, long userId, UserSession session) {
         String name = userFullName(from);
         String tag = userTag(from);
         String phone = String.valueOf(session.data.getOrDefault(K_PHONE, ""));
-        String fileId = String.valueOf(session.data.getOrDefault(K_HOTEL_PHOTO_FILE_ID, ""));
+        String attJson = String.valueOf(session.data.getOrDefault(K_HOTEL_PHOTO_ATTACHMENT_JSON, ""));
 
         String caption =
                 "🆕 Заявка: СРАВНИТЬ ЦЕНУ (отель)\n" +
@@ -361,24 +411,27 @@ public class KraskiTourBot extends TelegramLongPollingBot {
                         "🔗 Тег: " + tag + "\n" +
                         "📞 Телефон: " + phone;
 
-        // отправляем админам фото + подпись
+        ObjectNode attachment = null;
+        if (attJson != null && !attJson.isBlank()) {
+            try {
+                JsonNode node = mapper.readTree(attJson);
+                if (node.isObject()) attachment = (ObjectNode) node;
+            } catch (Exception ignored) {
+            }
+        }
+
         for (Long adminId : admins.listAdmins()) {
             try {
-                SendPhoto sp = new SendPhoto();
-                sp.setChatId(String.valueOf(adminId));
-                sp.setPhoto(new InputFile(fileId)); // переиспользуем file_id от пользователя
-                sp.setCaption(caption);
-                // без ParseMode, чтобы не ломалось от символов
-                execute(sp);
+                sendHtmlToUser(adminId, caption, attachment);
             } catch (Exception e) {
                 log.warn("Failed to send compare photo to admin {}", adminId, e);
             }
         }
 
-        requests.add("HOTEL_COMPARE", userId, caption + "\n[fileId=" + fileId + "]");
+        requests.add("HOTEL_COMPARE", userId, caption + "\n[attachment=" + attJson + "]");
     }
 
-    private void finalizeHotelPick(User from, long userId, UserSession session) {
+    private void finalizeHotelPick(JsonNode from, long userId, UserSession session) {
         String name = userFullName(from);
         String tag = userTag(from);
         String phone = String.valueOf(session.data.getOrDefault(K_PHONE, ""));
@@ -398,7 +451,7 @@ public class KraskiTourBot extends TelegramLongPollingBot {
         requests.add("HOTEL_PICK", userId, adminText);
     }
 
-    private void finalizeGeneric(User from, long userId, UserSession session, String source) {
+    private void finalizeGeneric(JsonNode from, long userId, UserSession session, String source) {
         String name = userFullName(from);
         String tag = userTag(from);
         String phone = String.valueOf(session.data.getOrDefault(K_PHONE, ""));
@@ -417,10 +470,7 @@ public class KraskiTourBot extends TelegramLongPollingBot {
     private void notifyAdminsText(String text) {
         for (Long adminId : admins.listAdmins()) {
             try {
-                SendMessage sm = new SendMessage();
-                sm.setChatId(String.valueOf(adminId));
-                sm.setText(text);
-                execute(sm);
+                sendHtmlToUser(adminId, text, null);
             } catch (Exception e) {
                 log.warn("Failed to notify admin {}", adminId, e);
             }
@@ -429,91 +479,91 @@ public class KraskiTourBot extends TelegramLongPollingBot {
 
     // ====== Админ панель ======
 
-    private void openAdmin(long chatId, long userId) throws TelegramApiException {
-        if (!admins.isAdmin(userId)) {
-            sendHtml(chatId, "⛔ Нет доступа.", null);
+    private void openAdmin(Ctx ctx) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sendHtml(ctx, "⛔ Нет доступа.", null);
             return;
         }
-        sendHtml(chatId, "🔐 <b>Админ панель</b>", Keyboards.adminMenu());
+        sendHtml(ctx, "🔐 <b>Админ панель</b>", Keyboards.adminMenu());
     }
 
-    private void adminList(long chatId, long userId) throws TelegramApiException {
-        if (!admins.isAdmin(userId)) {
-            sendHtml(chatId, "⛔ Нет доступа.", null);
+    private void adminList(Ctx ctx) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sendHtml(ctx, "⛔ Нет доступа.", null);
             return;
         }
-        List<Long> list = admins.listAdmins();
+        var list = admins.listAdmins();
         StringBuilder sb = new StringBuilder("👥 <b>Админы:</b>\n");
         if (list.isEmpty()) sb.append("— пусто");
         else {
             for (Long id : list) sb.append("• ").append(id).append("\n");
         }
-        sendHtml(chatId, sb.toString(), Keyboards.adminMenu());
+        sendHtml(ctx, sb.toString(), Keyboards.adminMenu());
     }
 
-    private void adminAddFlow(long chatId, long userId) throws TelegramApiException {
-        if (!admins.isAdmin(userId)) {
-            sendHtml(chatId, "⛔ Нет доступа.", null);
+    private void adminAddFlow(Ctx ctx) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sendHtml(ctx, "⛔ Нет доступа.", null);
             return;
         }
-        UserSession s = sessions.getOrCreate(userId, chatId);
+        UserSession s = sessions.getOrCreate(ctx.userId, ctx.chatId);
         s.data = new HashMap<>();
-        sessions.setState(userId, chatId, UserState.ADMIN_ADD_WAIT_ID, s.data);
-        sendHtml(chatId, "➕ Отправьте Telegram <b>user_id</b> нового админа (число).", null);
+        sessions.setState(ctx.userId, ctx.chatId, UserState.ADMIN_ADD_WAIT_ID, s.data);
+        sendHtml(ctx, "➕ Отправьте <b>user_id</b> нового админа (число).", null);
     }
 
-    private void adminRemoveFlow(long chatId, long userId) throws TelegramApiException {
-        if (!admins.isAdmin(userId)) {
-            sendHtml(chatId, "⛔ Нет доступа.", null);
+    private void adminRemoveFlow(Ctx ctx) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sendHtml(ctx, "⛔ Нет доступа.", null);
             return;
         }
-        UserSession s = sessions.getOrCreate(userId, chatId);
+        UserSession s = sessions.getOrCreate(ctx.userId, ctx.chatId);
         s.data = new HashMap<>();
-        sessions.setState(userId, chatId, UserState.ADMIN_REMOVE_WAIT_ID, s.data);
-        sendHtml(chatId, "➖ Отправьте Telegram <b>user_id</b> админа, которого нужно удалить (число).", null);
+        sessions.setState(ctx.userId, ctx.chatId, UserState.ADMIN_REMOVE_WAIT_ID, s.data);
+        sendHtml(ctx, "➖ Отправьте <b>user_id</b> админа, которого нужно удалить (число).", null);
     }
 
-    private void handleAdminAddId(long chatId, long userId, UserSession session, String text) throws TelegramApiException {
-        if (!admins.isAdmin(userId)) {
-            sessions.clear(userId, chatId);
-            sendHtml(chatId, "⛔ Нет доступа.", null);
+    private void handleAdminAddId(Ctx ctx, String text) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sessions.clear(ctx.userId, ctx.chatId);
+            sendHtml(ctx, "⛔ Нет доступа.", null);
             return;
         }
         try {
             long id = Long.parseLong(text.trim());
             admins.addAdmin(id);
-            sessions.clear(userId, chatId);
-            sendHtml(chatId, "✅ Админ добавлен: <b>" + id + "</b>", Keyboards.adminMenu());
+            sessions.clear(ctx.userId, ctx.chatId);
+            sendHtml(ctx, "✅ Админ добавлен: <b>" + id + "</b>", Keyboards.adminMenu());
         } catch (NumberFormatException e) {
-            sendHtml(chatId, "Введите число (user_id).", null);
+            sendHtml(ctx, "Введите число (user_id).", null);
         }
     }
 
-    private void handleAdminRemoveId(long chatId, long userId, UserSession session, String text) throws TelegramApiException {
-        if (!admins.isAdmin(userId)) {
-            sessions.clear(userId, chatId);
-            sendHtml(chatId, "⛔ Нет доступа.", null);
+    private void handleAdminRemoveId(Ctx ctx, String text) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sessions.clear(ctx.userId, ctx.chatId);
+            sendHtml(ctx, "⛔ Нет доступа.", null);
             return;
         }
         try {
             long id = Long.parseLong(text.trim());
             admins.removeAdmin(id);
-            sessions.clear(userId, chatId);
-            sendHtml(chatId, "✅ Админ удалён: <b>" + id + "</b>", Keyboards.adminMenu());
+            sessions.clear(ctx.userId, ctx.chatId);
+            sendHtml(ctx, "✅ Админ удалён: <b>" + id + "</b>", Keyboards.adminMenu());
         } catch (NumberFormatException e) {
-            sendHtml(chatId, "Введите число (user_id).", null);
+            sendHtml(ctx, "Введите число (user_id).", null);
         }
     }
 
-    private void adminLastRequests(long chatId, long userId) throws TelegramApiException {
-        if (!admins.isAdmin(userId)) {
-            sendHtml(chatId, "⛔ Нет доступа.", null);
+    private void adminLastRequests(Ctx ctx) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sendHtml(ctx, "⛔ Нет доступа.", null);
             return;
         }
 
         var last = requests.last(10);
         if (last.isEmpty()) {
-            sendHtml(chatId, "🗂 Заявок пока нет.", Keyboards.adminMenu());
+            sendHtml(ctx, "🗂 Заявок пока нет.", Keyboards.adminMenu());
             return;
         }
 
@@ -532,85 +582,236 @@ public class KraskiTourBot extends TelegramLongPollingBot {
             sb.append(p).append("\n\n");
         }
 
-        sendHtml(chatId, sb.toString(), Keyboards.adminMenu());
+        sendHtml(ctx, sb.toString(), Keyboards.adminMenu());
+    }
+
+    // ====== /add helpers ======
+
+    private void handleAddCommand(Ctx ctx, String text) {
+        if (!admins.isAdmin(ctx.userId)) {
+            sendHtml(ctx, "⛔ Нет доступа.", null);
+            return;
+        }
+
+        String[] parts = text.trim().split("\\s+");
+        if (parts.length >= 2) {
+            try {
+                long id = Long.parseLong(parts[1]);
+                admins.addAdmin(id);
+                sendHtml(ctx, "✅ Админ добавлен: <b>" + id + "</b>", Keyboards.adminMenu());
+            } catch (NumberFormatException e) {
+                sendHtml(ctx, "Введите корректный <b>user_id</b>. Пример: <code>/add 123456</code>", null);
+            }
+            return;
+        }
+
+        // выводим список активных пользователей
+        long now = System.currentTimeMillis();
+        long sinceMs = now - 30L * 24 * 60 * 60 * 1000;
+        var list = activeUsers.listActive(sinceMs, 200);
+        if (list.isEmpty()) {
+            sendHtml(ctx, "Пока нет активных пользователей за последние 30 дней.", null);
+            return;
+        }
+
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneOffset.UTC);
+        StringBuilder sb = new StringBuilder("👥 <b>Активные пользователи (UTC, 30 дней):</b>\n");
+        for (var u : list) {
+            String name = buildName(u.firstName, u.lastName);
+            String uname = (u.username == null || u.username.isBlank()) ? "" : " @" + u.username.trim();
+            sb.append("• ").append(name).append(uname)
+                    .append(" — <code>").append(u.userId).append("</code>")
+                    .append(" (").append(fmt.format(Instant.ofEpochMilli(u.lastSeen))).append(")\n");
+        }
+        sb.append("\nЧтобы назначить админа: <code>/add USER_ID</code>");
+        sendHtml(ctx, sb.toString(), null);
     }
 
     // ====== Helpers ======
 
-    private void sendHtml(long chatId, String text, InlineKeyboardMarkup kb) throws TelegramApiException {
-        SendMessage sm = new SendMessage();
-        sm.setChatId(String.valueOf(chatId));
-        sm.setText(text);
-        sm.setParseMode(ParseMode.HTML);
-        if (kb != null) sm.setReplyMarkup(kb);
-        execute(sm);
+    private void sendHtml(Ctx ctx, String text, ObjectNode keyboard) {
+        ArrayNode attachments = null;
+        if (keyboard != null) {
+            attachments = mapper.createArrayNode();
+            attachments.add(keyboard);
+        }
+        sendHtmlWithAttachments(ctx, text, attachments);
     }
 
-    private void sendPhotoFromResources(long chatId, String resourcePath, String caption, InlineKeyboardMarkup kb) throws TelegramApiException {
-        // 1) если уже знаем file_id — шлем без загрузки
-        String cachedFileId = resourcePhotoFileIdCache.get(resourcePath);
-        if (cachedFileId != null && !cachedFileId.isBlank()) {
-            SendPhoto sp = new SendPhoto();
-            sp.setChatId(String.valueOf(chatId));
-            sp.setPhoto(new InputFile(cachedFileId));
-            sp.setCaption(caption);
-            sp.setParseMode(ParseMode.HTML);
-            if (kb != null) sp.setReplyMarkup(kb);
-            execute(sp);
-            return;
-        }
+    private void sendHtmlWithAttachments(Ctx ctx, String text, ArrayNode attachments) {
+        ObjectNode body = buildMessageBody(text, attachments);
+        api.sendMessage(ctx.sendChatId, ctx.userId, body);
+    }
 
-        // 2) иначе грузим из ресурсов и после отправки сохраняем file_id
-        try (InputStream is = getClass().getClassLoader().getResourceAsStream(resourcePath)) {
-            if (is == null) {
-                sendHtml(chatId, caption + "\n\n(⚠️ Не найден ресурс: " + resourcePath + ")", kb);
+    private void sendHtmlToUser(long userId, String text, ObjectNode attachment) {
+        ArrayNode attachments = null;
+        if (attachment != null) {
+            attachments = mapper.createArrayNode();
+            attachments.add(attachment);
+        }
+        ObjectNode body = buildMessageBody(text, attachments);
+        api.sendMessage(null, userId, body);
+    }
+
+    private ObjectNode buildMessageBody(String text, ArrayNode attachments) {
+        ObjectNode body = mapper.createObjectNode();
+        if (text != null) body.put("text", text);
+        body.put("format", "html");
+        if (attachments != null && attachments.size() > 0) {
+            body.set("attachments", attachments);
+        }
+        return body;
+    }
+
+    private void sendPhotoFromResources(Ctx ctx, String resourcePath, String caption, ObjectNode keyboard) {
+        try {
+            ObjectNode imageAttachment = getImageAttachment(resourcePath);
+            if (imageAttachment == null) {
+                sendHtml(ctx, caption + "\n\n(⚠️ Не найден ресурс: " + resourcePath + ")", keyboard);
                 return;
             }
 
-            String fileName = resourcePath.contains("/")
-                    ? resourcePath.substring(resourcePath.lastIndexOf('/') + 1)
-                    : "image.jpg";
+            ArrayNode attachments = mapper.createArrayNode();
+            attachments.add(imageAttachment);
+            if (keyboard != null) attachments.add(keyboard);
 
-            SendPhoto sp = new SendPhoto();
-            sp.setChatId(String.valueOf(chatId));
-            sp.setPhoto(new InputFile(is, fileName));
-            sp.setCaption(caption);
-            sp.setParseMode(ParseMode.HTML);
-            if (kb != null) sp.setReplyMarkup(kb);
-
-            Message sent = execute(sp);
-
-            // достаем file_id (берем самый большой размер)
-            List<PhotoSize> photos = sent.getPhoto();
-            if (photos != null && !photos.isEmpty()) {
-                PhotoSize best = photos.get(photos.size() - 1);
-                if (best.getFileId() != null && !best.getFileId().isBlank()) {
-                    resourcePhotoFileIdCache.put(resourcePath, best.getFileId());
-                }
-            }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+            sendHtmlWithAttachments(ctx, caption, attachments);
+        } catch (Exception e) {
+            log.warn("Failed to send image {}", resourcePath, e);
+            sendHtml(ctx, caption, keyboard);
         }
     }
 
-    private void answerCb(String callbackId) throws TelegramApiException {
-        AnswerCallbackQuery a = new AnswerCallbackQuery();
-        a.setCallbackQueryId(callbackId);
-        execute(a);
+    private ObjectNode getImageAttachment(String resourcePath) throws IOException, InterruptedException {
+        ObjectNode cached = resourcePhotoCache.get(resourcePath);
+        if (cached != null) return cached;
+
+        byte[] bytes = readResourceBytes(resourcePath);
+        if (bytes == null) return null;
+
+        String fileName = resourcePath.contains("/")
+                ? resourcePath.substring(resourcePath.lastIndexOf('/') + 1)
+                : "image.jpg";
+        String contentType = guessContentType(fileName);
+
+        ObjectNode payload = api.uploadImage(bytes, fileName, contentType);
+        ObjectNode attachment = mapper.createObjectNode();
+        attachment.put("type", "image");
+        attachment.set("payload", payload);
+
+        resourcePhotoCache.put(resourcePath, attachment);
+        return attachment;
     }
 
-    private static String userFullName(User u) {
-        if (u == null) return "(unknown)";
-        String fn = u.getFirstName() == null ? "" : u.getFirstName().trim();
-        String ln = u.getLastName() == null ? "" : u.getLastName().trim();
-        String full = (fn + " " + ln).trim();
+    private static byte[] readResourceBytes(String resourcePath) throws IOException {
+        try (InputStream is = KraskiTourBot.class.getClassLoader().getResourceAsStream(resourcePath)) {
+            if (is == null) return null;
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            is.transferTo(out);
+            return out.toByteArray();
+        }
+    }
+
+    private static String guessContentType(String fileName) {
+        String lower = fileName == null ? "" : fileName.toLowerCase();
+        if (lower.endsWith(".png")) return "image/png";
+        if (lower.endsWith(".gif")) return "image/gif";
+        return "image/jpeg";
+    }
+
+    private static ObjectNode extractFirstAttachment(JsonNode body, String type) {
+        if (body == null || body.isNull()) return null;
+        JsonNode atts = body.path("attachments");
+        if (!atts.isArray()) return null;
+        for (JsonNode att : atts) {
+            if (type.equals(att.path("type").asText("")) && att.isObject()) {
+                return (ObjectNode) att;
+            }
+        }
+        return null;
+    }
+
+    private static String extractContactPhone(JsonNode body) {
+        if (body == null || body.isNull()) return null;
+        JsonNode atts = body.path("attachments");
+        if (!atts.isArray()) return null;
+        for (JsonNode att : atts) {
+            String type = att.path("type").asText("");
+            if (!"contact".equals(type) && !"request_contact".equals(type)) continue;
+            JsonNode payload = att.path("payload");
+            String phone = firstText(payload.path("phone"), payload.path("phone_number"), payload.path("number"));
+            if (phone != null) return phone;
+        }
+        return null;
+    }
+
+    private static String userFullName(JsonNode u) {
+        if (u == null || u.isNull()) return "(unknown)";
+        String fn = firstText(u.path("first_name"), u.path("name"));
+        String ln = firstText(u.path("last_name"));
+        String full = (nullToEmpty(fn) + " " + nullToEmpty(ln)).trim();
         return full.isBlank() ? "(no name)" : full;
     }
 
-    private static String userTag(User u) {
-        if (u == null) return "(нет)";
-        String un = u.getUserName();
+    private static String userTag(JsonNode u) {
+        if (u == null || u.isNull()) return "(нет)";
+        String un = firstText(u.path("username"));
         if (un == null || un.isBlank()) return "(нет)";
         return "@" + un.trim();
+    }
+
+    private static long pickLong(JsonNode... nodes) {
+        for (JsonNode n : nodes) {
+            if (n != null && n.isNumber()) return n.asLong();
+            if (n != null && n.isTextual()) {
+                try {
+                    return Long.parseLong(n.asText());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static Long pickLongNullable(JsonNode... nodes) {
+        for (JsonNode n : nodes) {
+            if (n != null && n.isNumber()) return n.asLong();
+            if (n != null && n.isTextual()) {
+                try {
+                    return Long.parseLong(n.asText());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String firstText(JsonNode... nodes) {
+        for (JsonNode n : nodes) {
+            if (n != null && n.isTextual()) {
+                String t = n.asText();
+                if (!t.isBlank()) return t;
+            }
+        }
+        return null;
+    }
+
+    private static String nullToEmpty(String s) {
+        return s == null ? "" : s;
+    }
+
+    private void updateActiveUser(JsonNode user) {
+        if (user == null || user.isNull()) return;
+        long userId = pickLong(user.path("user_id"));
+        if (userId <= 0) return;
+        String firstName = firstText(user.path("first_name"), user.path("name"));
+        String lastName = firstText(user.path("last_name"));
+        String username = firstText(user.path("username"));
+        activeUsers.upsert(userId, firstName, lastName, username, System.currentTimeMillis());
+    }
+
+    private static String buildName(String first, String last) {
+        String full = (nullToEmpty(first) + " " + nullToEmpty(last)).trim();
+        return full.isBlank() ? "(no name)" : full;
     }
 }

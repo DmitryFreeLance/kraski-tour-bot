@@ -15,13 +15,6 @@
     </properties>
 
     <dependencies>
-        <!-- TelegramBots 6.9.7.1 -->
-        <dependency>
-            <groupId>org.telegram</groupId>
-            <artifactId>telegrambots</artifactId>
-            <version>6.9.7.1</version>
-        </dependency>
-
         <!-- SQLite -->
         <dependency>
             <groupId>org.xerial</groupId>

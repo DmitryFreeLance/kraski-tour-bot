@@ -1,9 +1,13 @@
 package ru.kraskitour.bot;
 
-import org.telegram.telegrambots.meta.TelegramBotsApi;
-import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
 import ru.kraskitour.bot.config.BotConfig;
-import ru.kraskitour.bot.db.*;
+import ru.kraskitour.bot.db.ActiveUserRepository;
+import ru.kraskitour.bot.db.AdminRepository;
+import ru.kraskitour.bot.db.Db;
+import ru.kraskitour.bot.db.RequestRepository;
+import ru.kraskitour.bot.db.SessionRepository;
+import ru.kraskitour.bot.max.MaxApiClient;
+import ru.kraskitour.bot.max.MaxLongPoller;
 
 import java.io.File;
 
@@ -21,11 +25,15 @@ public class Main {
 
         SessionRepository sessionRepo = new SessionRepository(db);
         RequestRepository requestRepo = new RequestRepository(db);
+        ActiveUserRepository activeUserRepo = new ActiveUserRepository(db);
 
-        TelegramBotsApi api = new TelegramBotsApi(DefaultBotSession.class);
-        api.registerBot(new KraskiTourBot(cfg, sessionRepo, adminRepo, requestRepo));
+        MaxApiClient api = new MaxApiClient(cfg.token, cfg.apiBaseUrl);
+        KraskiTourBot bot = new KraskiTourBot(cfg, api, sessionRepo, adminRepo, requestRepo, activeUserRepo);
 
-        System.out.println("Started @" + cfg.username);
+        System.out.println("Started MAX bot @" + cfg.username);
+
+        MaxLongPoller poller = new MaxLongPoller(api, bot, cfg.pollingTimeoutSec, cfg.pollingLimit, cfg.pollingErrorBackoffMs);
+        poller.runForever();
     }
 
     private static void ensureDbDir(String dbPath) {
