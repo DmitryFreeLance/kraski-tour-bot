@@ -30,8 +30,8 @@ public class Texts {
 
     // ✅ Новое сообщение после получения номера телефона
     public static final String PHONE_SAVED =
-            "✅ <b>Записали ваш номер телефона.</b>\n" +
-                    "⏳ Наш менеджер скоро свяжется с вами";
+            "✅ <b>Записали Ваш номер телефона.</b>\n" +
+                    "⏳ Наш менеджер скоро свяжется с Вами";
 
     // Schengen
     public static final String SCHENGEN_MAIN =
